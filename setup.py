@@ -105,7 +105,7 @@ setup(
             "imitation-train-rl=imitation.scripts.train_rl:main_console",
         ],
     },
-    url="https://github.com/HumanCompatibleAI/imitation",
+    url="https://github.com/RIVeR-Lab/imitation",
     license="MIT",
     classifiers=[
         # Trove classifiers
