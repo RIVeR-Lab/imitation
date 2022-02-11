@@ -27,6 +27,7 @@ from imitation.policies import exploration_wrapper
 from imitation.rewards import common as rewards_common
 from imitation.rewards import reward_nets, reward_wrapper
 from imitation.util import logger as imit_logger
+from imitation.util import networks
 
 
 class TrajectoryGenerator(abc.ABC):
@@ -41,7 +42,7 @@ class TrajectoryGenerator(abc.ABC):
         Args:
             custom_logger: Where to log to; if None (default), creates a new logger.
         """
-        self._logger = custom_logger or imit_logger.configure()
+        self.logger = custom_logger or imit_logger.configure()
 
     @abc.abstractmethod
     def sample(self, steps: int) -> Sequence[TrajectoryWithRew]:
@@ -155,8 +156,10 @@ class AgentTrainer(TrajectoryGenerator):
         self.buffering_wrapper = wrappers.BufferingWrapper(venv)
         self.venv = reward_wrapper.RewardVecEnvWrapper(
             self.buffering_wrapper,
-            reward_fn,
+            self.reward_fn,
         )
+        self.log_callback = self.venv.make_log_callback()
+
         self.algorithm.set_env(self.venv)
         policy = rollout._policy_to_callable(
             self.algorithm,
@@ -188,7 +191,12 @@ class AgentTrainer(TrajectoryGenerator):
                 f"There are {n_transitions} transitions left in the buffer. "
                 "Call AgentTrainer.sample() first to clear them.",
             )
-        self.algorithm.learn(total_timesteps=steps, reset_num_timesteps=False, **kwargs)
+        self.algorithm.learn(
+            total_timesteps=steps,
+            reset_num_timesteps=False,
+            callback=self.log_callback,
+            **kwargs,
+        )
 
     def sample(self, steps: int) -> Sequence[types.TrajectoryWithRew]:
         agent_trajs, _ = self.buffering_wrapper.pop_finished_trajectories()
@@ -228,7 +236,6 @@ class AgentTrainer(TrajectoryGenerator):
                 sample_until=sample_until,
             )
             additional_trajs, _ = self.buffering_wrapper.pop_finished_trajectories()
-
             agent_trajs = list(agent_trajs) + list(additional_trajs)
 
         agent_trajs = _get_trajectories(agent_trajs, agent_steps)
@@ -629,7 +636,6 @@ class RewardTrainer(abc.ABC):
         self.model = model
         self.logger = custom_logger or imit_logger.configure()
 
-    @abc.abstractmethod
     def train(self, dataset: PreferenceDataset, epoch_multiplier: float = 1.0):
         """Train the reward model on a batch of fragment pairs and preferences.
 
@@ -638,6 +644,12 @@ class RewardTrainer(abc.ABC):
             epoch_multiplier: how much longer to train for than usual
                 (measured relatively).
         """
+        with networks.training(self.model):
+            self._train(dataset, epoch_multiplier)
+
+    @abc.abstractmethod
+    def _train(self, dataset: PreferenceDataset, epoch_multiplier: float):
+        """Train the reward model; see ``train`` for details."""
 
 
 class CrossEntropyRewardTrainer(RewardTrainer):
@@ -652,6 +664,7 @@ class CrossEntropyRewardTrainer(RewardTrainer):
         lr: float = 1e-3,
         discount_factor: float = 1.0,
         threshold: float = 50,
+        weight_decay: float = 0.0,
         custom_logger: Optional[imit_logger.HierarchicalLogger] = None,
     ):
         """Initialize the reward model trainer.
@@ -676,6 +689,9 @@ class CrossEntropyRewardTrainer(RewardTrainer):
                 in returns that are above this threshold. This threshold
                 is therefore in logspace. The default value of 50 means
                 that probabilities below 2e-22 are rounded up to 2e-22.
+            weight_decay: the weight decay factor for the reward model's weights
+                to use with ``th.optim.AdamW``. This is similar to but not equivalent
+                to L2 regularization, see https://arxiv.org/abs/1711.05101
             custom_logger: Where to log to; if None (default), creates a new logger.
         """
         super().__init__(model, custom_logger)
@@ -684,7 +700,11 @@ class CrossEntropyRewardTrainer(RewardTrainer):
         self.epochs = epochs
         self.discount_factor = discount_factor
         self.threshold = threshold
-        self.optim = th.optim.Adam(self.model.parameters(), lr=lr)
+        self.optim = th.optim.AdamW(
+            self.model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
 
     def _loss(
         self,
@@ -761,13 +781,12 @@ class CrossEntropyRewardTrainer(RewardTrainer):
         model_probability = 1 / (1 + returns_diff.exp())
         return self.noise_prob * 0.5 + (1 - self.noise_prob) * model_probability
 
-    def train(self, dataset: PreferenceDataset, epoch_multiplier: float = 1.0):
+    def _train(self, dataset: PreferenceDataset, epoch_multiplier: float = 1.0):
         """Trains for `epoch_multiplier * self.epochs` epochs over `dataset`."""
         # TODO(ejnnr): This isn't specific to the loss function or probability model.
         # In general, it might be best to split the probability model, the loss and
         # the optimization procedure a bit more cleanly so that different versions
         # can be combined
-
         dataloader = th.utils.data.DataLoader(
             dataset,
             batch_size=self.batch_size,
